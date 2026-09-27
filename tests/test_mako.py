@@ -159,18 +159,24 @@ class TestValidation(unittest.TestCase):
 
 
 class TestDeviceSafety(unittest.TestCase):
-    def _fake_sysfs(self, tmp, iface, name='hidraw1'):
+    # вендор mako и посторонний, реально висящий на этой же машине
+    MAKO = '0003:2E3C:C365'
+    LOGITECH = '0003:046D:C53F'
+
+    def _fake_sysfs(self, tmp, iface, name='hidraw1', suffix='0001',
+                    vendor=None):
         # раскладка повторяет настоящий sysfs:
         # /sys/class/hidraw/hidrawN -> ../../devices/.../0003:2E3C:C365.000X/hidraw/hidrawN
         # внутри class-узла симлинк device на hid-устройство
-        # bInterfaceNumber лежит в родиле этого устройства, рядом с другими b* атрибутами
+        # bInterfaceNumber лежит в родителе этого устройства, рядом с другими b* атрибутами
         # имя каталога устройства уникально на каждый интерфейс, как в sysfs
-        # число 000X вытаскиваем из имени узла, чтобы интерфейсы не сливались
-        suffix = '0001' if name == 'hidraw1' else name.replace('hidraw', '000')
-        devdir = (tmp / 'devices' / 'pci0000:00' / 'usb1' / '1-2'
-                  / f'1-2:1.{iface}' / f'0003:2E3C:C365.{suffix}')
+        vid, pid = (vendor or self.MAKO).split(':')[1:]
+        bus = 'usb1'
+        devdir = (tmp / 'devices' / 'pci0000:00' / bus / '1-2'
+                  / f'1-2:1.{iface}' / f'0003:{vid}:{pid}.{suffix}')
         devdir.mkdir(parents=True)
-        (devdir / 'uevent').write_text('DRIVER=hid-generic HID_ID=0003:00002E3C:0000C365\n')
+        (devdir / 'uevent').write_text(
+            f'DRIVER=hid-generic HID_ID=0003:0000{vid}:0000{pid}\n')
         (devdir.parent / 'bInterfaceNumber').write_text(iface + '\n')
 
         entry = tmp / name
@@ -182,6 +188,27 @@ class TestDeviceSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._fake_sysfs(Path(tmp), '02')
             self.assertEqual(mako.find_hidraw(root), '/dev/hidraw1')
+
+    def test_find_hidraw_ignores_other_vendor(self):
+        # logitech на интерфейсе 02 идёт первым по порядку. mako тоже на 02,
+        # но позже. фильтр по вендору обязан отбросить logitech, иначе
+        # отправка уйдёт в чужое устройство. на этой машине именно так
+        def make(tmp, name, suffix, vendor):
+            self._fake_sysfs(tmp, '02', name=name, suffix=suffix, vendor=vendor)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make(root, 'hidraw1', '0001', self.LOGITECH)
+            make(root, 'hidraw2', '0002', self.MAKO)
+            self.assertEqual(mako.find_hidraw(root), '/dev/hidraw2')
+
+    def test_find_hidraw_only_other_vendor(self):
+        # на дереве только чужой вендор с правильным интерфейсом.
+        # должен быть отказ, а не запись в чужое устройство
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._fake_sysfs(Path(tmp), '02', vendor=self.LOGITECH)
+            with self.assertRaises(RuntimeError):
+                mako.find_hidraw(root)
 
     def test_find_hidraw_wrong_interface(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,15 +235,20 @@ class TestDeviceSafety(unittest.TestCase):
     # до os.open, и без мока тест падает на машине без клавиатуры
 
     def test_send_rejects_regular_file(self):
-        # обычный файл вместо hidraw не должен получить запись
+        # обычный файл вместо hidraw не должен получить запись.
+        # os.write намеренно возвращает полную длину пакета: иначе тест
+        # падал бы не на проверке S_ISCHR, а на вторичном эффекте
+        # (неполная запись), то есть проверял бы не то
+        pkt = bytearray(64)
         with mock.patch.object(mako, 'find_hidraw', return_value='/dev/hidraw9'):
             with mock.patch.object(mako.os, 'open', return_value=42):
                 with mock.patch.object(mako.os, 'fstat') as fake_fstat:
                     fake_fstat.return_value.st_mode = stat.S_IFREG | 0o644
                     with mock.patch.object(mako.os, 'close'):
-                        with mock.patch.object(mako.os, 'write') as fake_write:
+                        with mock.patch.object(mako.os, 'write',
+                                               return_value=len(pkt)) as fake_write:
                             with self.assertRaises(RuntimeError):
-                                mako.send_packet(bytearray(64))
+                                mako.send_packet(pkt)
                             fake_write.assert_not_called()
 
     def test_send_full_write(self):
