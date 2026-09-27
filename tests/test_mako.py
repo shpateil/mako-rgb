@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import io
 import os
 import stat
@@ -73,12 +74,27 @@ class TestProtocol(unittest.TestCase):
         self.assertTrue(any(p[1] == 0x0f for p in sent), 'нет кадра 0x0f')
 
     def test_no_global_0x07(self):
+        # 0x07 гасит клавиатуру целиком, посылать его нельзя. проверка
+        # отрицательная, поэтому сама по себе вхолостую: если blink вообще
+        # ничего не отправит, тест останется зелёным. поэтому сначала
+        # утверждаем что кадры 0x0f ушли, и только потом проверяем отсутствие 0x07
         sent = []
         with mock.patch.object(mako, 'send_packet', side_effect=sent.append):
             with mock.patch.object(mako.time, 'sleep'):
                 with mock.patch.object(mako.time, 'time', side_effect=[0, 11]):
                     mako.send_loop({(0, 0): (9, 9, 9)}, 10)
+                    blink_start = len(sent)
                     mako.cmd_blink(255, 0, 255, 2)
+
+        frames = [p for p in sent if p[1] == 0x0f]
+        self.assertTrue(frames, 'ни одного кадра 0x0f не отправлено')
+        blink = sent[blink_start:]
+        self.assertTrue(blink, 'blink ничего не отправил, проверка 0x07 вхолостую')
+        self.assertTrue(any(p[1] == 0x0f for p in blink),
+                        'blink не отправил ни одного кадра 0x0f')
+        # в каждом кадре 0x0f цвет мигания должен реально стоять
+        self.assertTrue(any(p[18:21] == bytes([255, 0, 255]) for p in blink if p[1] == 0x0f),
+                        'цвет 255,0,255 не попал ни в один кадр')
         for p in sent:
             self.assertNotEqual(p[1], 0x07, 'команда 0x07 запрещена')
 
@@ -103,20 +119,36 @@ class TestValidation(unittest.TestCase):
             mako.positive_int('abc')
         self.assertEqual(mako.positive_int('1'), 1)
 
+    # эти три проверяют разбор argv. ожидаем что main() выйдет через SystemExit
+    # на этапе парсинга, до обращения к железу. send_packet замокан на случай
+    # если валидация всё же не сработает: без мока тест дёрнул бы живую
+    # клавиатуру вместо того чтобы просто упасть
+
+    def _run_argv(self, argv):
+        sent = []
+        err = io.StringIO()
+        with mock.patch('sys.argv', argv):
+            with mock.patch.object(mako, 'send_packet', side_effect=sent.append):
+                with mock.patch.object(mako.time, 'sleep'):
+                    with contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit):
+                            mako.main()
+        return sent, err.getvalue()
+
     def test_rgb_parsing(self):
-        with mock.patch('sys.argv', ['mako', 'all', '300', '0', '0']):
-            with self.assertRaises(SystemExit):
-                mako.main()
+        sent, err = self._run_argv(['mako', 'all', '300', '0', '0'])
+        self.assertIn('0..255', err, 'нет сообщения о диапазоне')
+        self.assertEqual(sent, [], 'валидация не остановила запись в ленту')
 
     def test_unknown_key(self):
-        with mock.patch('sys.argv', ['mako', 'key', 'nokey', '1', '2', '3']):
-            with self.assertRaises(SystemExit):
-                mako.main()
+        sent, err = self._run_argv(['mako', 'key', 'nokey', '1', '2', '3'])
+        self.assertIn('неизвестная клавиша', err)
+        self.assertEqual(sent, [], 'валидация не остановила запись в ленту')
 
     def test_unknown_color(self):
-        with mock.patch('sys.argv', ['mako', 'notify', 'gold']):
-            with self.assertRaises(SystemExit):
-                mako.main()
+        sent, err = self._run_argv(['mako', 'notify', 'gold'])
+        self.assertIn('invalid choice', err)
+        self.assertEqual(sent, [], 'валидация не остановила запись в ленту')
 
 
 class TestDeviceSafety(unittest.TestCase):
