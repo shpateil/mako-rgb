@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import io
+import itertools
 import os
 import stat
 import sys
@@ -130,9 +131,15 @@ class TestValidation(unittest.TestCase):
         with mock.patch('sys.argv', argv):
             with mock.patch.object(mako, 'send_packet', side_effect=sent.append):
                 with mock.patch.object(mako.time, 'sleep'):
-                    with contextlib.redirect_stderr(err):
-                        with self.assertRaises(SystemExit):
-                            mako.main()
+                    # send_loop крутится по time.time(), без мока он ушёл бы
+                    # в реальный десятисекундный цикл и тест повис бы вместо
+                    # того чтобы упасть. счётчик делает цикл конечным
+                    ticks = itertools.count(0, 0.5)
+                    with mock.patch.object(mako.time, 'time',
+                                           side_effect=lambda: next(ticks)):
+                        with contextlib.redirect_stderr(err):
+                            with self.assertRaises(SystemExit):
+                                mako.main()
         return sent, err.getvalue()
 
     def test_rgb_parsing(self):
